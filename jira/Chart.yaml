@@ -1,0 +1,25 @@
+apiVersion: v2
+name: jira-software
+description: Helm chart for Atlassian Jira Software.
+type: application
+version: 4.1.0
+appVersion: 8.15.0
+keywords:
+  - jira
+  - jira-software
+  - atlassian
+  - agile
+  - project
+  - management
+home: https://www.atlassian.com/software/jira
+icon: https://wac-cdn.atlassian.com/dam/jcr:b544631f-b225-441b-9e05-57b7fd0d495b/Jira%20Software@2x-icon-blue.png
+sources:
+  - https://bitbucket.org/atlassian-docker/docker-atlassian-jira/
+  - https://hub.docker.com/r/atlassian/jira-software/
+maintainers:
+  - name: Jorge Porciuncula
+dependencies:
+  - name: postgresql
+    version: 4.2.2
+    repository: https://charts.bitnami.com/bitnami/
+    condition: postgresql.enabled

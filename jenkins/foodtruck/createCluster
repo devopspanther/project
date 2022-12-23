@@ -1,0 +1,599 @@
+/*
+IaC :: Create Foodtruck Cluster
+This Jenkinsfile creates a Foodtruck cluster (Production, Staging and User)
+Parameters needed:
+  - "envName": "production", "staging" or "user"
+  - "iacRegion": "us-west-1", "us-east-1"
+  - Applications: Each application should have an env variable
+    - "artifactory" "jcr_ver" "oss_ver"
+    - "atlassian"
+    - "awx" "_ver"
+    - "cmafront"
+    - "defectdojo" "_ver"
+    - "elk" "_ver"
+    - "gitlab"
+    - "jenkins" "_ver"
+    - "keycloak" "_ver"
+    - "mlsecops"
+    - "openldap" "_ver"
+    - "owaspdeptrack" "_ver"
+    - "pca" "_ver"
+    - "sde" "_ver"
+    - "sde_dev" "_ver" "_admin_mode"
+    - "securecodebox"
+    - "sonarqube" "_ver"
+    - "strapi"
+*/
+
+pipeline {
+  agent { label 'jenkins-slave' }
+  environment { 
+    IMAGE = "757687274468.dkr.ecr.us-west-1.amazonaws.com/foodtruck:latest"
+    REGISTRY = "757687274468.dkr.ecr.us-west-1.amazonaws.com"
+  }
+  stages {
+    stage ('Linting') {
+      parallel {
+        stage ('Ansible') {
+          steps {
+            script {
+              sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+              docker.image("$IMAGE").inside {
+                sh /* Linting Ansible using ansible-lint */ '''
+                  ansible-lint -x command-instead-of-module,command-instead-of-shell,no-changed-when,unnamed-task,experimental,git-latest -p foodtruck-v1/foodtruck-v1.yml
+                '''
+              }
+            }
+          }
+        }
+        stage ('Terraform') {
+          steps {
+            script {
+              sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+              docker.image("$IMAGE").inside {
+                sh /* Init prior to validating */ '''terraform init -backend=false ./foodtruck-v1/terraform'''
+                sh /* Terraform validate */ '''terraform validate ./foodtruck-v1/terraform'''
+              }
+            }
+          }
+        }
+        stage ('Checkov') {
+          steps {
+            script {
+              sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+              docker.image("$IMAGE").inside {
+                sh /* Checkov linting */ '''checkov --directory ./foodtruck-v1/terraform'''
+              }
+            }
+          }
+        }
+        stage ('GitLeaks') {
+          steps {
+            script {
+              sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+              docker.image("$IMAGE").inside {
+                sh /* GitLeaks linting */ '''$HOME/go/bin/gitleaks --path=./foodtruck-v1 -v'''
+              }
+            }
+          }
+        }
+        stage ('Kubelinter') {
+          steps {
+            script {
+              sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+              docker.image("$IMAGE").inside {
+                sh /* Kubelinter linting */ '''kube-linter lint ./foodtruck-v1/helm/cmafront/'''
+              }
+            }
+          }
+        }
+      }
+    }
+    stage ('Set files and env vars') {
+      steps {
+        script {
+          sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+          docker.image("$IMAGE").inside {
+            wrap([$class: 'BuildUser']) {
+              env.TF_ENV = "foodtruck"
+              env.HOSTED_ZONE = "Z2KBAPVGPRZ50I"
+              env.BASE_URL = "dsolab.net"
+              env.ALB_CIDRS = "142.112.83\\.2/32\\,34\\.198\\.218\\.0/24\\,174\\.142\\.184\\.242/32\\,\
+              68\\.182\\.135\\.114/32\\,3\\.213\\.79\\.176/32\\,34\\.206\\.230\\.175/32\\,52\\.203\\.223\\.215/32\\,\
+              54\\.83\\.74\\.180/32\\,50\\.18\\.7\\.122/32\\,\
+              54\\.215\\.42\\.139/32\\,54\\.176\\.183\\.169/32\\,52\\.9\\.247\\.205/32\\,13\\.52\\.57\\.234/32\\,54\\.215\\.89\\.193/32\\,54\\.241\\.120\\.37/32\\,54\\.215\\.215\\.163/32\\,\
+              52\\.72\\.241\\.9/32\\,54\\.224\\.12\\.14/32\\,3\\.235\\.200\\.176/32\\,54\\.236\\.137\\.48/32\\,44\\.193\\.242\\.133/32\\,50\\.19\\.60\\.117/32\\,54\\.144\\.188\\.226/32" /* Line 4: EIP Pool of CIDRs (us-west-1); Line 5: EIP Pool of CIDRs (us-east-1)*/
+              env.TLS_CERT = "s3://foodtruck-storage/dsolab.crt"
+              env.TLS_KEY = "s3://foodtruck-storage/dsolab.key"
+              env.TF_BUCKET = "foodtruck-tfstates"
+              env.SC_SDE_USER = sh(script: "aws secretsmanager get-secret-value --region us-east-1 --secret-id production/docker/sc_dsolab --output text --query \"SecretString\" | cut -d':' -f1 | tr -d '\"{['", returnStdout: true).trim()
+              env.SC_SDE_PASS = sh(script: "aws secretsmanager get-secret-value --region us-east-1 --secret-id production/docker/sc_dsolab --output text --query \"SecretString\" | cut -d':' -f2 | tr -d '\"}]'", returnStdout: true).trim()
+              env.DOCKERUSER = sh(script: "aws secretsmanager get-secret-value --region us-east-1 --secret-id production/dsolabs/dockerhub --output text --query \"SecretString\" | cut -d':' -f1 | tr -d '\"{['", returnStdout: true).trim()
+              env.DOCKERPASS = sh(script: "aws secretsmanager get-secret-value --region us-east-1 --secret-id production/dsolabs/dockerhub --output text --query \"SecretString\" | cut -d':' -f2 | tr -d '\"}]'", returnStdout: true).trim()
+              if ("us-east-1".equals(iacRegion)) {
+                env.AWS_REGION = "us-east-1"
+                env.AWS_DEFAULT_REGION = "us-east-1"
+                env.TF_VAR_region = "us-east-1"
+                env.SSL_CERT_ARN = "arn:aws:acm:us-east-1:757687274468:certificate/8e514af9-3a29-45f4-af33-6d5a6e2f81ba"
+              } else {
+                env.AWS_REGION = "us-west-1"
+                env.AWS_DEFAULT_REGION = "us-west-1"
+                env.TF_VAR_region = "us-west-1"
+                env.SSL_CERT_ARN = "arn:aws:acm:us-west-1:757687274468:certificate/32c28b40-f546-49f3-b9e2-2af17fd70c84"
+              }
+              if ("production".equals(envName)) {
+                env.TF_VAR_prefix_user = "production"
+                env.TF_CLI_ARGS_init = "-backend-config='key=production/foodtruck-v1.tfstate'"
+              } else if ("staging".equals(envName)) {
+                env.TF_VAR_prefix_user = "staging"
+                env.TF_CLI_ARGS_init = "-backend-config='key=staging/foodtruck-v1.tfstate'"
+              } else if ("prod-dso".equals(envName)) {
+                env.TF_VAR_prefix_user = "prod-dso"
+                env.TF_CLI_ARGS_init = "-backend-config='key=prod-dso/foodtruck-v1.tfstate'"
+              } else {
+                env.TF_VAR_prefix_user = sh(script: "echo ${BUILD_USER_ID} | cut -d@ -f 1", returnStdout: true).trim()
+                env.TF_CLI_ARGS_init = sh(script: "echo -backend-config='key=${TF_VAR_prefix_user}/foodtruck-v1.tfstate'", returnStdout: true).trim()
+              }
+              sh /* Save our env variables to file and Stash files as well */ '''declare -p -x > ./envVars'''
+              stash includes: 'envVars', name: 'envVars'
+            }
+          }
+        }
+      }
+    }
+    stage ('IaC - Deploy') {
+      steps {
+        script {
+          unstash 'envVars'
+          sh(script: "echo $DOCKERPASS | docker login --username $DOCKERUSER --password-stdin > /dev/null 2>&1", returnStdout: false)
+          sh /* Save the Docker Hub Credentials */ '''cp ~/.docker/config.json ./dockerHubCreds'''
+          sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+          docker.image("$IMAGE").inside {
+            unstash 'envVars'
+            sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+            sh /* Run Ansible IaC Playbook */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags terraform'''
+            sh /* Save our new env variables to file and Stash files as well */ '''declare -p -x > ./envVars'''
+            stash includes: 'envVars', name: 'envVars'
+          }
+        }
+      }
+    }
+    stage ('Authentication / Authorization') {
+      parallel {
+        stage ('Keycloak') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(keycloak)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install Keycloak on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags keycloak'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('OpenLDAP') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(openldap)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install OpenLDAP on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags openldap'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage ('Misc Applications') {
+      parallel {
+        stage ('Atlassian') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(atlassian)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install Atlassian on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags atlassian'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('Gitlab') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(gitlab)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install Gitlab on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags gitlab'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('Jenkins') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(jenkins)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install Jenkins on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags jenkins'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('AWX') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(awx)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install AWX on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags awx'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('ELK') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(elk)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install ELK on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags elk'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('Strapi') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(strapi)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install Strapi on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags strapi'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage ('Security Compass Applications') {
+      parallel {
+        stage ('SDE') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(sde)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install SDE PRD on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags sde'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('SDE DEV') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(sde_dev)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install SDE DEV on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags sde_dev'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('PCA') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(pca)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install PCA on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags pca'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage ('Security Compass Internal Applications') {
+      parallel {
+        stage ('CMAFront') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(cmafront)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install CMAFront on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags cmafront'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('MLSecOps') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(mlsecops)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    dir("mlsecops") { git credentialsId: 'deployTokenAgra', url: 'https://agra.sdelements.com/dso-lab/foodtruck/mlsecops.git' }
+                    sh /* Install MLSecOps on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags mlsecops'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage ('Third Party Sec Applications') {
+      parallel {
+        stage ('Artifactory') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(artifactory)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install Artifactory on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags artifactory'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('Sonarqube') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(sonarqube)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install Sonarqube on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags sonarqube'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('OWASP Dependency Track') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(owaspdeptrack)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars > /dev/null 2>&1'''
+                    sh /* Install OWASP Dependency Track on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags owaspdeptrack'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('DefectDojo') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(defectdojo)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars'''
+                    sh /* Install SDE on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags defectdojo'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+        stage ('SecureCodeBox') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                if ("true".equals(securecodebox)) {
+                  sh /* AWS ECR Auth */ '''aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REGISTRY'''
+                  docker.image("$IMAGE").inside {
+                    unstash 'envVars'
+                    sh /* Import env vars */ '''. ./envVars'''
+                    sh /* Install SDE on the cluster */ '''ansible-playbook ./foodtruck-v1/foodtruck-v1.yml --tags securecodebox'''
+                  }
+                } else {
+                  sh /* App not selected for install */ '''echo "Application not selected for install"'''
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  post {
+    success {
+      emailext body: " \
+        <br> \
+        <h2>Cluster ${env.TF_VAR_prefix_user}.${env.BASE_URL} deployed successfully. </h2><br> \
+        <h3>Application info: </h3><br> \
+        =========================================== <br> \
+        <b>Artifactory</b> - Selected for install: <b>${env.artifactory}</b><br> \
+        Version (JCR - OSS): ${env.artifactoryjcr_ver} - ${env.artifactoryoss_ver}<br> \
+        URL (JCR - OSS): https://jcr-${env.TF_VAR_prefix_user}.${env.BASE_URL} - https://oss-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: artifactory-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>AWX</b> - Selected for install: <b>${env.awx}</b><br> \
+        Version: ${env.awx_ver}<br> \
+        URL: https://awx-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: awx-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>ELK</b> - Selected for install: <b>${env.elk}</b><br> \
+        Version: ${env.elk_ver}<br> \
+        URL (Kibana): https://kibana-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        URL (Logstash): https://logstash-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        URL (Beats): https://beats-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        URL (ElasticSearch): https://elasticsearch-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: elk-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>KeyCloak</b> - Selected for install: <b>${env.keycloak}</b><br> \
+        Version: ${env.keycloak_ver} <br> \
+        URL: https://keycloak-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: keycloak-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>OpenLDAP</b> - Selected for install: <b>${env.openldap}</b><br> \
+        Version: ${env.openldap_ver} <br> \
+        URL (internal): ldap://openldap.openldap.svc.cluster.local:389 <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: openldap-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>OWASP Dep Track</b> - Selected for install: <b>${env.owaspdeptrack}</b><br> \
+        Version: ${env.owaspdeptrack_ver} <br> \
+        URL: https://owaspdeptrack-${env.TF_VAR_prefix_user}.${env.BASE_URL}  <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: owaspdeptrack-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>Jira</b> - Selected for install: <b>${env.atlassian}</b><br> \
+        Version: 8.15.0 (static) <br> \
+        URL: https://jira-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: jira-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>GitLab</b> - Selected for install: <b>${env.gitlab}</b><br> \
+        Version: latest (static) <br> \
+        URL: https://gitlab-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: gitlab-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>Jenkins</b> - Selected for install: <b>${env.jenkins}</b><br> \
+        Version: ${env.jenkins_ver} <br> \
+        URL: https://jenkins-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: jenkins-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>SD Elements</b> - Selected for install: <b>${env.sde}</b><br> \
+        Version: ${env.sde_ver} <br> \
+        URL: https://sde-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: sde-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>PCA</b> - Selected for install: <b>${env.pca}</b><br> \
+        Version: ${env.pca_ver} <br> \
+        URL: https://pca-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: pca-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <b>SonarQube</b> - Selected for install: <b>${env.sonarqube}</b><br> \
+        Version: ${env.sonarqube_ver} <br> \
+        URL: https://sonarqube-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        Credentials on AWS Secrets: Region: ${env.AWS_REGION} / Key: sonarqube-${env.TF_VAR_prefix_user}.${env.BASE_URL} <br> \
+        =========================================== <br> \
+        <br> \
+      ",
+      mimeType: 'text/html',
+      subject: "[Jenkins] createCluster deployed -Status: Success",
+      recipientProviders: [developers(), requestor()]
+    }
+    unstable {
+      emailext body: "Cluster ${env.TF_VAR_prefix_user}.${env.BASE_URL} deployed with errors.",
+      mimeType: 'text/html',
+      subject: "[Jenkins] createCluster deployed -Status: Unstable",
+      recipientProviders: [developers(), requestor()]
+    }
+    failure {
+      emailext body: "Cluster ${env.TF_VAR_prefix_user}.${env.BASE_URL} failed deployment, check logs on Jenkins for more details.",
+      mimeType: 'text/html',
+      subject: "[Jenkins] createCluster failed",
+      recipientProviders: [developers(), requestor()]
+    }
+    always {
+      cleanWs(cleanWhenNotBuilt: true, deleteDirs: true)
+    }
+  }
+}

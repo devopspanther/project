@@ -1,0 +1,110 @@
+---
+# Foodtruck v1
+# :: Spin up and configure JFrog's Artifactory using Helm Charts
+# :: Tags: [artifactory]
+
+- name: (PREPARE THE DISHES) Install JFROG Artifactory JCR / OSS on EKS (Helm)
+  hosts: localhost
+  connection: local
+  tags:
+    - artifactory
+  handlers:
+    - include: ./handlers/artifactory-jcr-routes.yml
+    - include: ./handlers/artifactory-oss-routes.yml
+  pre_tasks: # Get KUBECONFIG, Create random credentials and Add Helm Repositories
+    - name: Get .kubeconfig
+      ansible.builtin.shell: aws eks update-kubeconfig --name ${TF_VAR_prefix_user}-foodtruck-v1
+    - name: Previous Install Checking
+      block:
+        - name: Get previously set username (AWS Secrets Manager)
+          ansible.builtin.shell:
+            aws secretsmanager get-secret-value --secret-id artifactory-$TF_VAR_prefix_user.$BASE_URL
+            --output text --query \"SecretString\" | cut -d',' -f1 | cut -d':' -f2 | tr -d '\"}]'
+          register: previousUser
+        - name: Get previously set password (AWS Secrets Manager)
+          ansible.builtin.shell:
+            aws secretsmanager get-secret-value --secret-id artifactory-$TF_VAR_prefix_user.$BASE_URL
+            --output text --query \"SecretString\" | cut -d',' -f2 | cut -d':' -f2 | tr -d '\"}]'
+          register: previousPass
+        - name: Fail if credentials are invalid
+          ansible.builtin.fail:
+            msg: "Credentials obtained from AWS Secrets Manager are invalid, new ones will be created"
+          when: previousUser.stdout is not search("admin")
+        - name: Set Admin credentials using previously set values (AWS Secrets Manager)
+          ansible.builtin.set_fact:
+            adminUser: "{{ previousUser.stdout }}"
+            adminPass: "{{ previousPass.stdout }}"
+      rescue:
+        - name: Create a 12 digits password for the Admin credentials
+          ansible.builtin.set_fact:
+            adminUser: "admin"
+            adminPass: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=12') }}"
+    - name: Add Artifactory Helm Repository
+      ansible.builtin.shell: helm repo add center https://charts.jfrog.io --force-update
+    - name: Update Helm repository
+      ansible.builtin.shell: helm repo update
+  tasks: # Install Helm Charts
+    - name: Install Artifactory JCR (Helm)
+      ansible.builtin.shell: >
+        helm upgrade --install artifactory-jcr -f helm/artifactory-jcr-values.yaml
+        --timeout 1800s
+        --set artifactory.ingress.hosts[0]="artifactory-jcr-$TF_VAR_prefix_user.$BASE_URL"
+        --set artifactory.ingress.annotations."alb\.ingress\.kubernetes\.io/certificate-arn"="$SSL_CERT_ARN"
+        --set artifactory.ingress.annotations."alb\.ingress\.kubernetes\.io/inbound-cidrs"="$ALB_CIDRS"
+        --set artifactory.artifactory.admin.ip="*"
+        --set artifactory.artifactory.admin.username="{{ adminUser }}"
+        --set artifactory.artifactory.admin.password="{{ adminPass }}"
+        --set artifactory.artifactory.image.tag="{{ ansible_env.artifactoryjcr_ver }}"
+        --create-namespace -n artifactory-jcr center/artifactory-jcr
+    - name: Install Artifactory OSS (Helm)
+      ansible.builtin.shell: >
+        helm upgrade --install artifactory-oss -f helm/artifactory-oss-values.yaml
+        --timeout 1800s
+        --set artifactory.ingress.hosts[0]="artifactory-oss-$TF_VAR_prefix_user.$BASE_URL"
+        --set artifactory.ingress.annotations."alb\.ingress\.kubernetes\.io/certificate-arn"="$SSL_CERT_ARN"
+        --set artifactory.ingress.annotations."alb\.ingress\.kubernetes\.io/inbound-cidrs"="$ALB_CIDRS"
+        --set artifactory.artifactory.admin.ip="*"
+        --set artifactory.artifactory.admin.username="{{ adminUser }}"
+        --set artifactory.artifactory.admin.password="{{ adminPass }}"
+        --set artifactory.artifactory.image.tag="{{ ansible_env.artifactoryoss_ver }}"
+        --create-namespace -n artifactory-oss center/artifactory-oss
+  post_tasks: # Make sure Deployments are Available, create Route53 DNS entries, Write Credentials to AWS Secrets and Display App URLS
+    - name: Make sure Artifactory JCR Deployments are available
+      ansible.builtin.shell: >
+        kubectl wait -n artifactory-jcr --for=condition=available deployments --all --timeout=1800s
+    - name: Make sure Artifactory OSS Deployments are available
+      ansible.builtin.shell: >
+        kubectl wait -n artifactory-oss --for=condition=available deployments --all --timeout=1800s
+    - name: Route Based handlers
+      ansible.builtin.shell: >
+        echo "Route 53 Handlers"
+      notify:
+        - Artifactory JCR - Get ALB
+        - Artifactory JCR - Get ALB Hosted Zone ID
+        - Artifactory JCR - Template JSON Create record
+        - Artifactory JCR - Change Route53 entry
+        - Artifactory OSS - Get ALB
+        - Artifactory OSS - Get ALB Hosted Zone ID
+        - Artifactory OSS - Template JSON Create record
+        - Artifactory OSS - Change Route53 entry
+    - ansible.builtin.meta: flush_handlers
+    - name: AWS Secrets Manager handling
+      block:
+        - name: Write application Admin credentials to AWS Secrets Manager
+          ansible.builtin.shell: >
+            aws secretsmanager create-secret --name artifactory-$TF_VAR_prefix_user.$BASE_URL
+            --description "Credentials for artifactory-$TF_VAR_prefix_user.$BASE_URL"
+            --secret-string '{"username":"{{ adminUser }}","password":"{{ adminPass }}"}'
+            --tags '[{"Key":"cluster","Value":"{{ ansible_env.TF_VAR_prefix_user }}"},{"Key":"environment","Value":"{{ ansible_env.TF_ENV }}"}]'
+      rescue:
+        - name: Update application Admin credentials to AWS Secrets Manager
+          ansible.builtin.shell: >
+            aws secretsmanager update-secret --secret-id artifactory-$TF_VAR_prefix_user.$BASE_URL
+            --secret-string '{"username":"{{ adminUser }}","password":"{{ adminPass }}"}'
+    - name: Display URLS
+      ansible.builtin.debug:
+        msg:
+          - "JFrog's Container Registry URL: https://jcr-{{ ansible_env.TF_VAR_prefix_user }}.{{ ansible_env.BASE_URL }}"
+          - "JFrog's Artifactory OSS URL: https://oss-{{ ansible_env.TF_VAR_prefix_user }}.{{ ansible_env.BASE_URL }}"
+          - "Credentials on AWS Secrets: Region: {{ ansible_env.AWS_REGION }} /
+            Key: artifactory-{{ ansible_env.TF_VAR_prefix_user }}.{{ ansible_env.BASE_URL }}"

@@ -1,0 +1,105 @@
+---
+# Foodtruck v1
+# :: Spin up and configure Atlassian Tools using Helm Charts (Jira)
+# :: Tags: [atlassian]
+
+- name: (PREPARE THE DISHES) Install Atlassian Toolset on EKS (Helm)
+  hosts: localhost
+  connection: local
+  tags:
+    - atlassian
+  handlers:
+    - include: ./handlers/jira-routes.yml
+  pre_tasks: # Get KUBECONFIG, Create random credentials and Add Helm Repositories
+    - name: Get .kubeconfig
+      ansible.builtin.shell: aws eks update-kubeconfig --name ${TF_VAR_prefix_user}-foodtruck-v1
+    - name: Create a 12 digits password for the Admin credentials
+      ansible.builtin.set_fact:
+        adminUser: "admin"
+        adminPass: "foodtruck"
+  tasks: # Install Helm Charts
+    - name: Create Jira Namespace
+      ansible.builtin.shell: kubectl create namespace jira
+      ignore_errors: true
+    - name: Create Docker Hub Credentials Secret
+      ansible.builtin.shell: >
+        kubectl create secret generic dockerhubcreds \
+        -n jira \
+        --from-file=.dockerconfigjson=../dockerHubCreds \
+        --type=kubernetes.io/dockerconfigjson \
+      ignore_errors: true
+    - name: Install Jira (Helm)
+      ansible.builtin.shell: >
+        helm upgrade --install jira helm/jira/ -f helm/jira-values.yaml
+        --timeout 1800s
+        --set ingress.hosts="jira-$TF_VAR_prefix_user.$BASE_URL"
+        --set ingress.annotations."alb\.ingress\.kubernetes\.io/certificate-arn"="$SSL_CERT_ARN"
+        --set ingress.annotations."alb\.ingress\.kubernetes\.io/inbound-cidrs"="$ALB_CIDRS"
+        --create-namespace -n jira
+    - name: Create Pod to copy over Jira Application Data
+      ansible.builtin.shell: >
+        kubectl apply -f post-install/atlassian/jira/podCopyJiraData.yaml -n jira
+    - name: Make sure pod is available before Restoration begins
+      ansible.builtin.shell: >
+        kubectl wait -n jira --for=condition=ready pods pod-copy-jira-data --timeout=1800s
+    - name: Restore Jira Application Data (this takes ~10mins)
+      ansible.builtin.shell: >
+        kubectl cp post-install/atlassian/jira/home/jira-home.tar.gz jira/pod-copy-jira-data:/var/atlassian/application-data/;
+        kubectl cp post-install/atlassian/jira/install/jira-install.tar.gz jira/pod-copy-jira-data:/opt/atlassian/;
+        kubectl exec pod-copy-jira-data -n jira --
+        sh -c "tar -xvzf /var/atlassian/application-data/jira-home.tar.gz --directory /var/atlassian/application-data/";
+        kubectl exec pod-copy-jira-data -n jira --
+        sh -c "tar -xvzf /opt/atlassian/jira-install.tar.gz --directory /opt/atlassian/";
+        kubectl exec pod-copy-jira-data -n jira --
+        sh -c "chmod -R 777 /var/atlassian/application-data/jira";
+        kubectl exec pod-copy-jira-data -n jira --
+        sh -c "chmod -R 777 /opt/atlassian/jira";
+    - name: Delete Pod to copy over Jira Application Data
+      ansible.builtin.shell: >
+        kubectl delete pod pod-copy-jira-data -n jira
+    - name: Restore PGSQL DB
+      ansible.builtin.shell: >
+        set -o pipefail && \
+        cat post-install/atlassian/jira/database-jira.sql |
+        kubectl exec -i jira-postgresql-0 -n jira --
+        bash -c "PGPASSWORD="jiradbUser123" psql -U postgres -d jiradb"
+    - name: Adjust our instance's urls
+      ansible.builtin.shell: >
+        kubectl exec -i jira-postgresql-0 -n jira --
+        bash -c PGPASSWORD="jiradbUser123" psql -U postgres -d jiradb -c
+        "update gadgetuserpreference set userprefvalue = REPLACE(userprefvalue, \'//staging-jira.$BASE_URL/\', \'//jira-${TF_VAR_prefix_user}.$BASE_URL/\')
+        where userprefvalue like \'\%//staging-jira.$BASE_URL/\%\'\;"
+    - name: Bring Jira replicas to 1 after PGSQL Restore
+      ansible.builtin.shell: >
+        kubectl scale deploy jira-jira-software --replicas=1 -n jira
+  post_tasks: # Make sure Deployments are Available, create Route53 DNS entries, Write Credentials to AWS Secrets and Display App URLS
+    - name: Make sure Jira Deployments are available
+      ansible.builtin.shell: >
+        kubectl wait -n jira --for=condition=available deployments --all --timeout=1800s
+    - name: Route Based handlers
+      ansible.builtin.shell: >
+        echo "Route 53 Handlers"
+      notify:
+        - Jira - Get ALB
+        - Jira - Get ALB Hosted Zone ID
+        - Jira - Template JSON Create record
+        - Jira - Change Route53 entry
+    - ansible.builtin.meta: flush_handlers
+    - name: AWS Secrets Manager handling
+      block:
+        - name: Write application Admin credentials to AWS Secrets Manager
+          ansible.builtin.shell: >
+            aws secretsmanager create-secret --name atlassian-$TF_VAR_prefix_user.$BASE_URL
+            --description "Credentials for atlassian-$TF_VAR_prefix_user.$BASE_URL"
+            --secret-string '{"username":"{{ adminUser }}","password":"{{ adminPass }}"}'
+            --tags '[{"Key":"cluster","Value":"{{ ansible_env.TF_VAR_prefix_user }}"},{"Key":"environment","Value":"{{ ansible_env.TF_ENV }}"}]'
+      rescue:
+        - name: Update application Admin credentials to AWS Secrets Manager
+          ansible.builtin.shell: >
+            aws secretsmanager update-secret --secret-id atlassian-$TF_VAR_prefix_user.$BASE_URL
+            --secret-string '{"username":"{{ adminUser }}","password":"{{ adminPass }}"}'
+    - name: Display URLS
+      ansible.builtin.debug:
+        msg:
+          - "Jira URL: https://jira-{{ ansible_env.TF_VAR_prefix_user }}.{{ ansible_env.BASE_URL }}"
+          - "Credentials on AWS Secrets: Region: {{ ansible_env.AWS_REGION }} / Key: atlassian-{{ ansible_env.TF_VAR_prefix_user }}.{{ ansible_env.BASE_URL }}"
